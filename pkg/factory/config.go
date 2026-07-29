@@ -34,9 +34,13 @@ const (
 	NrfMetricsDefaultPort        = 9091
 	NrfMetricsDefaultScheme      = "https"
 	NrfMetricsDefaultNamespace   = "free5gc"
-	NrfNfmResUriPrefix           = "/nnrf-nfm/v1"
-	NrfDiscResUriPrefix          = "/nnrf-disc/v1"
-	NrfBootstrappingPrefix       = "/bootstrapping"
+	// Heart-beat defaults (TS 29.510 clause 5.2.2.3): the NRF owns the interval
+	// and suspends an instance after Timer * SuspendFactor seconds of silence.
+	NrfDefaultHeartbeatTimer         = 10
+	NrfDefaultHeartbeatSuspendFactor = 2
+	NrfNfmResUriPrefix               = "/nnrf-nfm/v1"
+	NrfDiscResUriPrefix              = "/nnrf-disc/v1"
+	NrfBootstrappingPrefix           = "/bootstrapping"
 )
 
 type Config struct {
@@ -55,6 +59,15 @@ func (c *Config) Validate() (bool, error) {
 		if result, err := configuration.validate(); err != nil {
 			return result, err
 		}
+		// A dropDelay at or below the suspension deadline would deregister
+		// instances the moment they are suspended. Unset (0) disables the drop
+		// sweep entirely, so only a configured value is checked.
+		if dropDelay := c.GetHeartbeatDropDelay(); dropDelay > 0 &&
+			dropDelay <= c.GetHeartbeatTimer()*c.GetHeartbeatSuspendFactor() {
+			return false, fmt.Errorf(
+				"heartbeat dropDelay (%ds) must exceed the suspension deadline timer*suspendFactor (%ds)",
+				dropDelay, c.GetHeartbeatTimer()*c.GetHeartbeatSuspendFactor())
+		}
 	}
 
 	result, err := govalidator.ValidateStruct(c)
@@ -72,8 +85,21 @@ type Configuration struct {
 	Metrics         *Metrics      `yaml:"metrics,omitempty" valid:"optional"`
 	MongoDBName     string        `yaml:"MongoDBName" valid:"required"`
 	MongoDBUrl      string        `yaml:"MongoDBUrl" valid:"required"`
+	Heartbeat       *Heartbeat    `yaml:"heartbeat,omitempty" valid:"optional"`
 	DefaultPlmnId   models.PlmnId `yaml:"DefaultPlmnId" valid:"required"`
 	ServiceNameList []string      `yaml:"serviceNameList,omitempty" valid:"required"`
+}
+
+// Heartbeat configures the NF Heart-Beat procedure (TS 29.510 clause 5.2.2.3).
+// Timer is the interval advertised on registration; an instance silent for
+// Timer * SuspendFactor seconds is SUSPENDED. Setting DropDelay additionally
+// deregisters instances that stay SUSPENDED for that many seconds; unset, the
+// NRF suspends but never deletes. An NF re-registers on a heart-beat 404, so a
+// live instance dropped by mistake comes back on its next heart-beat.
+type Heartbeat struct {
+	Timer         int `yaml:"timer,omitempty" valid:"optional,range(1|3600)"`
+	SuspendFactor int `yaml:"suspendFactor,omitempty" valid:"optional,range(2|10)"`
+	DropDelay     int `yaml:"dropDelay,omitempty" valid:"optional,range(60|604800)"`
 }
 
 type Logger struct {
@@ -510,4 +536,42 @@ func (c *Config) GetServiceNameList() []string {
 	c.RLock()
 	defer c.RUnlock()
 	return c.Configuration.ServiceNameList
+}
+
+// GetHeartbeatTimer returns the heart-beat interval in seconds advertised to
+// registering NFs. The NRF owns it (TS 29.510 clause 5.2.2.3); an NF cannot
+// negotiate it.
+func (c *Config) GetHeartbeatTimer() int {
+	c.RLock()
+	defer c.RUnlock()
+	if hb := c.Configuration.Heartbeat; hb != nil && hb.Timer > 0 {
+		return hb.Timer
+	}
+	return NrfDefaultHeartbeatTimer
+}
+
+// GetHeartbeatSuspendFactor returns how many intervals may be missed before
+// an instance is SUSPENDED. range(2|10) keeps the deadline longer than the
+// interval, as TS 29.510 clause 5.2.2.3 requires.
+func (c *Config) GetHeartbeatSuspendFactor() int {
+	c.RLock()
+	defer c.RUnlock()
+	if hb := c.Configuration.Heartbeat; hb != nil && hb.SuspendFactor > 0 {
+		return hb.SuspendFactor
+	}
+	return NrfDefaultHeartbeatSuspendFactor
+}
+
+// GetHeartbeatDropDelay returns how long, in seconds, an instance may stay
+// SUSPENDED before it is deregistered, or 0 when dropDelay is unset and
+// deregistration is disabled. Validate keeps a configured value above the
+// suspension deadline; beyond that, an NF re-registers on a heart-beat 404,
+// so a wrongly dropped instance recovers on its next heart-beat.
+func (c *Config) GetHeartbeatDropDelay() int {
+	c.RLock()
+	defer c.RUnlock()
+	if hb := c.Configuration.Heartbeat; hb != nil && hb.DropDelay > 0 {
+		return hb.DropDelay
+	}
+	return 0
 }

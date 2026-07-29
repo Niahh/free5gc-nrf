@@ -3,6 +3,7 @@ package processor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/mitchellh/mapstructure"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 
 	nrf_context "github.com/free5gc/nrf/internal/context"
 	"github.com/free5gc/nrf/internal/logger"
@@ -40,6 +43,197 @@ func (p *Processor) getNFNotifyCtx(targetNF models.NrfNfManagementNfType) (conte
 		return nil, pd
 	}
 	return ctx, nil
+}
+
+// sweepBatchSize bounds one pass of either sweep; a larger backlog drains
+// over the following ticks.
+const sweepBatchSize = 256
+
+// SuspendStaleNfProfiles moves instances silent for timer * suspendFactor
+// seconds to SUSPENDED, out of discovery, and notifies their subscribers
+// (TS 29.510 clause 5.2.2.3).
+//
+// Each instance is claimed with an atomic findOneAndUpdate, so replicas
+// sharing a database notify disjoint sets. The deadline uses our configured
+// timer, never the stored profile's, which an NF could inflate. Instances
+// without a lastHeartBeat wait for their next NFUpdate to stamp one.
+func (p *Processor) SuspendStaleNfProfiles(ctx context.Context) {
+	deadline := time.Duration(factory.NrfConfig.GetHeartbeatTimer()*
+		factory.NrfConfig.GetHeartbeatSuspendFactor()) * time.Second
+	now := time.Now().UTC()
+	cutoff := now.Add(-deadline).Format(time.RFC3339)
+
+	coll := mongoapi.Client.Database(factory.NrfConfig.Configuration.MongoDBName).
+		Collection(nrf_context.NfProfileCollName)
+
+	for i := 0; i < sweepBatchSize; i++ {
+		var raw map[string]interface{}
+		err := coll.FindOneAndUpdate(ctx,
+			bson.M{
+				"nfStatus":      string(models.NrfNfManagementNfStatus_REGISTERED),
+				"lastHeartBeat": bson.M{"$lt": cutoff},
+			},
+			// suspendedAt starts the drop clock. The filter only matches
+			// REGISTERED instances, so the stamp is fresh at every transition.
+			bson.M{"$set": bson.M{
+				"nfStatus":    string(models.NrfNfManagementNfStatus_SUSPENDED),
+				"suspendedAt": now.Format(time.RFC3339),
+			}},
+			options.FindOneAndUpdate().SetReturnDocument(options.After),
+		).Decode(&raw)
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return
+		}
+		if err != nil {
+			logger.NfmLog.Errorf("Suspend stale NF profiles err: %+v", err)
+			return
+		}
+
+		var nfProfiles []models.NrfNfManagementNfProfile
+		if err = timedecode.Decode([]map[string]interface{}{raw}, &nfProfiles); err != nil || len(nfProfiles) == 0 {
+			logger.NfmLog.Errorf("Suspended NF profile decode error: %+v", err)
+			continue
+		}
+		logger.NfmLog.Infof("NF suspended, no heart-beat received: %v [%v]",
+			nfProfiles[0].NfType, nfProfiles[0].NfInstanceId)
+		p.notifySubscribers(models.NotificationEventType_PROFILE_CHANGED, &nfProfiles[0])
+	}
+}
+
+// notifySubscribers notifies every subscriber of the profile; failures are
+// logged so one unreachable target does not starve the rest. DEREGISTERED
+// carries no payload, as in NFDeregisterProcedure.
+func (p *Processor) notifySubscribers(
+	event models.NotificationEventType,
+	nfProfile *models.NrfNfManagementNfProfile,
+) {
+	payload := nfProfile
+	if event == models.NotificationEventType_DEREGISTERED {
+		payload = nil
+	}
+	nfInstanceUri := nrf_context.GetNfInstanceURI(nfProfile.NfInstanceId)
+	for _, target := range nrf_context.GetNofificationUri(nfProfile) {
+		notifCtx, pd := p.getNFNotifyCtx(target.TargetNf)
+		if pd != nil {
+			logger.NfmLog.Errorf("Notify %s failed: %+v", target.Uri, pd)
+			continue
+		}
+		if pd = p.Consumer().SendNFStatusNotify(notifCtx,
+			event, nfInstanceUri, target.Uri, payload); pd != nil {
+			logger.NfmLog.Errorf("Notify %s failed: %+v", target.Uri, pd)
+		}
+	}
+}
+
+// DropStaleSuspendedNfProfiles deregisters instances that stayed SUSPENDED
+// for more than dropDelay seconds (TS 29.510 clause 5.2.2.3), and does
+// nothing when dropDelay is unset. Without it, every NF restarting under a
+// fresh nfInstanceId leaves a stale SUSPENDED document behind forever.
+//
+// Guards against dropping a live instance:
+//   - The delay counts from suspendedAt, so after an NRF outage an instance
+//     still gets a full heart-beat window (the caller's startup grace).
+//   - An instance with a fresh lastHeartBeat is never claimed.
+//   - findOneAndDelete claims atomically: with several replicas, exactly one
+//     deregisters an instance, and its subscribers hear DEREGISTERED once.
+//   - An NF re-registers on a heart-beat 404, so an instance dropped while
+//     still alive is back in the registry on its next heart-beat.
+func (p *Processor) DropStaleSuspendedNfProfiles(ctx context.Context) {
+	// A zero delay would put the cutoff at now and drop every suspended
+	// instance on sight, so the guard stays here rather than in the caller.
+	delay := factory.NrfConfig.GetHeartbeatDropDelay()
+	if delay <= 0 {
+		return
+	}
+	now := time.Now().UTC()
+	cutoff := now.Add(-time.Duration(delay) * time.Second).Format(time.RFC3339)
+
+	coll := mongoapi.Client.Database(factory.NrfConfig.Configuration.MongoDBName).
+		Collection(nrf_context.NfProfileCollName)
+
+	// SUSPENDED documents without suspendedAt (older builds, or an NF that
+	// patched itself SUSPENDED) start their clock now: dropped one full delay
+	// later, never on sight.
+	if _, err := coll.UpdateMany(ctx,
+		bson.M{
+			"nfStatus":    string(models.NrfNfManagementNfStatus_SUSPENDED),
+			"suspendedAt": bson.M{"$exists": false},
+		},
+		bson.M{"$set": bson.M{"suspendedAt": now.Format(time.RFC3339)}}); err != nil {
+		logger.NfmLog.Errorf("Backfill suspendedAt err: %+v", err)
+	}
+
+	for i := 0; i < sweepBatchSize; i++ {
+		var raw map[string]interface{}
+		err := coll.FindOneAndDelete(ctx, bson.M{
+			"nfStatus":    string(models.NrfNfManagementNfStatus_SUSPENDED),
+			"suspendedAt": bson.M{"$lt": cutoff},
+			"$or": []bson.M{
+				{"lastHeartBeat": bson.M{"$lt": cutoff}},
+				{"lastHeartBeat": bson.M{"$exists": false}},
+			},
+		}).Decode(&raw)
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return
+		}
+		if err != nil {
+			logger.NfmLog.Errorf("Drop stale suspended NF profiles err: %+v", err)
+			return
+		}
+
+		var nfProfiles []models.NrfNfManagementNfProfile
+		if err = timedecode.Decode([]map[string]interface{}{raw}, &nfProfiles); err != nil || len(nfProfiles) == 0 {
+			logger.NfmLog.Errorf("Dropped NF profile decode error: %+v", err)
+			continue
+		}
+		profile := &nfProfiles[0]
+		logger.NfmLog.Infof("NF profile dropped, SUSPENDED since %v: %v [%v]",
+			raw["suspendedAt"], profile.NfType, profile.NfInstanceId)
+
+		// Same cleanup as NFDeregisterProcedure, logged rather than propagated:
+		// no client waits on the sweep.
+		p.notifySubscribers(models.NotificationEventType_DEREGISTERED, profile)
+		putData := bson.M{
+			"_link.item": bson.M{"href": nrf_context.GetNfInstanceURI(profile.NfInstanceId)},
+			"multi":      true,
+		}
+		if pullErr := mongoapi.RestfulAPIPullOne("urilist", bson.M{"nfType": profile.NfType}, putData); pullErr != nil {
+			logger.NfmLog.Errorf("Drop urilist cleanup err: %+v", pullErr)
+		}
+		if factory.NrfConfig.GetOAuth() {
+			nfCertPath := oauth.GetNFCertPath(
+				factory.NrfConfig.GetCertBasePath(), string(profile.NfType), profile.NfInstanceId)
+			if removeErr := os.Remove(nfCertPath); removeErr != nil {
+				logger.NfmLog.Warningf("Can not delete NFCertPem file: %v: %v", nfCertPath, removeErr)
+			}
+		}
+	}
+}
+
+// touchLastHeartBeat records the contact the sweeps measure against. Stored
+// as fixed-width UTC RFC3339: $lt needs lexicographic order to match
+// chronological order, which fractional seconds or a zone offset would break.
+func touchLastHeartBeat(nfInstanceID string) error {
+	_, err := mongoapi.Client.Database(factory.NrfConfig.Configuration.MongoDBName).
+		Collection(nrf_context.NfProfileCollName).
+		UpdateOne(context.Background(),
+			bson.M{"nfInstanceId": nfInstanceID},
+			bson.M{"$set": bson.M{"lastHeartBeat": time.Now().UTC().Format(time.RFC3339)}})
+	return err
+}
+
+// clearSuspension moves a suspended instance back to REGISTERED. The status
+// filter makes racing the sweep safe in both orders.
+func clearSuspension(nfInstanceID string) error {
+	_, err := mongoapi.Client.Database(factory.NrfConfig.Configuration.MongoDBName).
+		Collection(nrf_context.NfProfileCollName).
+		UpdateOne(context.Background(),
+			bson.M{
+				"nfInstanceId": nfInstanceID,
+				"nfStatus":     string(models.NrfNfManagementNfStatus_SUSPENDED),
+			},
+			bson.M{"$set": bson.M{"nfStatus": string(models.NrfNfManagementNfStatus_REGISTERED)}})
+	return err
 }
 
 func (p *Processor) HandleNFDeregisterRequest(c *gin.Context, nfInstanceId string) {
@@ -353,8 +547,6 @@ func (p *Processor) NFDeregisterProcedure(nfInstanceID string) *models.ProblemDe
 			logger.NfmLog.Warningf("Can not delete NFCertPem file: %v: %v", nfCertPath, removeErr)
 		}
 	}
-	// Minus NF Register Conter
-	p.Context().DelNfRegister()
 	logger.NfmLog.Infof("NfDeregister Success: %v [%v]", nfInstanceType, nfInstanceID)
 	return nil
 }
@@ -441,12 +633,28 @@ func (p *Processor) UpdateNFInstanceProcedure(
 		}
 	}
 
+	// The NFUpdate is the heart-beat (TS 29.510 clause 5.2.2.3): stamp it
+	// before the patch stores REGISTERED, or a concurrent sweep could claim
+	// the instance on its stale timestamp and re-suspend it. Failures are
+	// logged; the next heart-beat retries.
+	if err = touchLastHeartBeat(nfInstanceID); err != nil {
+		logger.NfmLog.Errorf("UpdateNFInstanceProcedure record heart-beat err: %+v", err)
+	}
+
 	if err := mongoapi.RestfulAPIJSONPatch(collName, filter, patchJSON); err != nil {
 		logger.NfmLog.Errorf("UpdateNFInstanceProcedure err: %+v", err)
 		return nil, &models.ProblemDetails{
 			Title:  "Malformed request syntax",
 			Status: http.StatusBadRequest,
 			Detail: err.Error(),
+		}
+	}
+	// A load-only heart-beat is still a heart-beat (clause 5.2.2.3): an
+	// NFUpdate that does not write nfStatus itself lifts a suspension, or a
+	// suspended instance that keeps heart-beating would stay SUSPENDED forever.
+	if !nfStatusPatched(patchJSON) {
+		if err = clearSuspension(nfInstanceID); err != nil {
+			logger.NfmLog.Errorf("UpdateNFInstanceProcedure clear suspension err: %+v", err)
 		}
 	}
 
@@ -460,6 +668,19 @@ func (p *Processor) UpdateNFInstanceProcedure(
 			Cause:  "SYSTEM_FAILURE",
 		}
 	}
+	// The instance can be deregistered between the writes above and this read.
+	if nf == nil {
+		logger.NfmLog.Warnf("NFProfile[%s] not found", nfInstanceID)
+		return nil, &models.ProblemDetails{
+			Status: http.StatusNotFound,
+			Cause:  "RESOURCE_URI_STRUCTURE_NOT_FOUND",
+			Detail: fmt.Sprintf("NFProfile[%s] not found", nfInstanceID),
+		}
+	}
+
+	// Sweep bookkeeping, not part of the exposed NF profile.
+	delete(nf, "lastHeartBeat")
+	delete(nf, "suspendedAt")
 
 	nfProfilesRaw := []map[string]interface{}{
 		nf,
@@ -518,6 +739,11 @@ func validateNfProfilePatch(patchJSON []byte) error {
 		if normalizedPath == "/nfinstanceid" || strings.HasPrefix(normalizedPath, "/nfinstanceid/") {
 			return fmt.Errorf("nfInstanceId is immutable and cannot be modified")
 		}
+		// heartBeatTimer is ours to set (clause 5.2.2.3): NFs reset their ticker
+		// from the response, so patching it to 0 would self-suspend.
+		if normalizedPath == "/heartbeattimer" || strings.HasPrefix(normalizedPath, "/heartbeattimer/") {
+			return fmt.Errorf("heartBeatTimer is set by the NRF and cannot be modified")
+		}
 
 		from, ok := operation["from"].(string)
 		if !ok {
@@ -528,9 +754,42 @@ func validateNfProfilePatch(patchJSON []byte) error {
 		if normalizedFrom == "/nfinstanceid" || strings.HasPrefix(normalizedFrom, "/nfinstanceid/") {
 			return fmt.Errorf("nfInstanceId is immutable and cannot be modified")
 		}
+		if normalizedFrom == "/heartbeattimer" || strings.HasPrefix(normalizedFrom, "/heartbeattimer/") {
+			return fmt.Errorf("heartBeatTimer is set by the NRF and cannot be modified")
+		}
 	}
 
 	return nil
+}
+
+// nfStatusPatched reports whether the patch writes nfStatus itself: then the
+// status is the NF's explicit choice; otherwise the update is a pure
+// heart-beat and may clear a suspension. The empty path is the whole-document
+// pointer.
+//
+// The comparison is byte-exact, JSON Pointers are case-sensitive: a patch
+// naming /NfStatus writes a separate key and must still count as a plain
+// heart-beat. Unlike validateNfProfilePatch, normalizing here would suppress
+// a correction instead of merely rejecting more patches.
+func nfStatusPatched(patchJSON []byte) bool {
+	var operations []struct {
+		Op   string `json:"op"`
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(patchJSON, &operations); err != nil {
+		return false
+	}
+	for _, operation := range operations {
+		if operation.Op == "test" {
+			// test asserts and never writes (RFC 6902).
+			continue
+		}
+		switch operation.Path {
+		case "", "/nfStatus":
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Processor) GetNFInstanceProcedure(c *gin.Context, nfInstanceID string) {
@@ -550,6 +809,9 @@ func (p *Processor) GetNFInstanceProcedure(c *gin.Context, nfInstanceID string) 
 		util.GinProblemJson(c, problemDetails)
 		return
 	}
+	// Sweep bookkeeping, not part of the exposed NF profile.
+	delete(response, "lastHeartBeat")
+	delete(response, "suspendedAt")
 	c.JSON(http.StatusOK, response)
 }
 
@@ -651,6 +913,13 @@ func (p *Processor) NFRegisterProcedure(
 		return
 	}
 
+	// The heart-beat window opens at registration. Written beside the profile,
+	// not into putData, so it never leaks into the response bodies below.
+	// Failures are logged; the first heart-beat stamps the field anyway.
+	if err = touchLastHeartBeat(nfInstanceId); err != nil {
+		logger.NfmLog.Errorf("NFRegisterProcedure record heart-beat err: %+v", err)
+	}
+
 	if existed {
 		logger.NfmLog.Infoln("NFRegister NfProfile Update:", nfInstanceId)
 		uriList := nrf_context.GetNofificationUri(&nf)
@@ -683,9 +952,6 @@ func (p *Processor) NFRegisterProcedure(
 		// set info for NotificationData
 		Notification_event := models.NotificationEventType_REGISTERED
 		nfInstanceUri := locationHeaderValue
-
-		// Add NF Register Conter
-		p.Context().AddNfRegister()
 
 		for _, target := range uriList {
 			notifCtxCreate, pd := p.getNFNotifyCtx(target.TargetNf)

@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -31,8 +30,6 @@ type NRFContext struct {
 	NrfPrivKey       *rsa.PrivateKey
 	NrfPubKey        *rsa.PublicKey
 	NrfCert          *x509.Certificate
-	NfRegistNum      int
-	nfRegistNumLock  sync.RWMutex
 }
 
 const (
@@ -56,7 +53,6 @@ func InitNrfContext() error {
 	nrfContext.NrfNfProfile.NfInstanceId = config.GetNfInstanceId()
 	nrfContext.NrfNfProfile.NfType = models.NrfNfManagementNfType_NRF
 	nrfContext.NrfNfProfile.NfStatus = models.NrfNfManagementNfStatus_REGISTERED
-	nrfContext.NfRegistNum = 0
 
 	serviceNameList := configuration.ServiceNameList
 
@@ -259,16 +255,4 @@ func (ctx *NRFContext) GetTokenCtx(
 		Expiry:      time.Unix(int64(now+expiration), 0),
 	})
 	return context.WithValue(context.Background(), openapi.ContextOAuth2, tok), nil, nil
-}
-
-func (ctx *NRFContext) AddNfRegister() {
-	ctx.nfRegistNumLock.Lock()
-	defer ctx.nfRegistNumLock.Unlock()
-	ctx.NfRegistNum += 1
-}
-
-func (ctx *NRFContext) DelNfRegister() {
-	ctx.nfRegistNumLock.Lock()
-	defer ctx.nfRegistNumLock.Unlock()
-	ctx.NfRegistNum -= 1
 }

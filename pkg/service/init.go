@@ -178,6 +178,9 @@ func (a *NrfApp) Start() {
 	a.wg.Add(1)
 	go a.listenShutdownEvent()
 
+	a.wg.Add(1)
+	go a.sweepStaleNfProfiles()
+
 	if err := a.sbiServer.Run(&a.wg); err != nil {
 		logger.MainLog.Fatalf("Run SBI server failed: %+v", err)
 	}
@@ -207,43 +210,62 @@ func (a *NrfApp) Terminate() {
 	a.cancel()
 }
 
+// sweepStaleNfProfiles runs the heart-beat sweeps once per heart-beat
+// interval: suspend instances silent past the suspension deadline, then,
+// when dropDelay is set and the startup grace has passed, deregister those
+// SUSPENDED past the drop delay. The database claims each instance for a
+// single replica, however many run.
+func (a *NrfApp) sweepStaleNfProfiles() {
+	defer a.wg.Done()
+
+	interval := time.Duration(a.cfg.GetHeartbeatTimer()) * time.Second
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	start := time.Now()
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case <-ticker.C:
+			a.sweepOnce(time.Since(start))
+		}
+	}
+}
+
+// sweepOnce recovers per tick: a panic must not silently kill the sweeper.
+func (a *NrfApp) sweepOnce(uptime time.Duration) {
+	defer func() {
+		if p := recover(); p != nil {
+			logger.MainLog.Errorf("panic in heart-beat sweep: %v\n%s", p, string(debug.Stack()))
+		}
+	}()
+	a.processor.SuspendStaleNfProfiles(a.ctx)
+	// Suspending first is safe: a fresh suspendedAt is never past the drop
+	// cutoff.
+	if dropGraceElapsed(uptime, a.cfg.GetHeartbeatTimer(), a.cfg.GetHeartbeatSuspendFactor()) {
+		a.processor.DropStaleSuspendedNfProfiles(a.ctx)
+	}
+}
+
+// dropGraceElapsed keeps the drop sweep quiet right after startup: while the
+// NRF was down, live instances could not lift their suspension. One
+// suspension deadline plus one interval lets them heart-beat back first.
+func dropGraceElapsed(uptime time.Duration, timer, suspendFactor int) bool {
+	return uptime > time.Duration(timer*(suspendFactor+1))*time.Second
+}
+
+// terminateProcedure stops serving but leaves the registry untouched: a
+// terminating replica must not deregister the whole network. Dead instances
+// are handled by the heart-beat sweep, here or on another replica.
 func (a *NrfApp) terminateProcedure() {
 	logger.MainLog.Infof("Terminating NRF...")
-
-	waitTime := 5
-	logger.MainLog.Infof("Waiting for %vs for other NFs to deregister", waitTime)
-	a.waitNfDeregister(waitTime)
-
-	logger.MainLog.Infof("Remove NF Profile...")
-	err := mongoapi.Drop(nrf_context.NfProfileCollName)
-	if err != nil {
-		logger.MainLog.Errorf("Drop NfProfile collection failed: %+v", err)
-	}
 
 	a.sbiServer.Stop()
 
 	if a.metricsServer != nil {
 		a.metricsServer.Stop()
 		logger.MainLog.Infof("NRF Metrics Server terminated")
-	}
-}
-
-func (a *NrfApp) waitNfDeregister(waitTime int) {
-	ctx, cancal := context.WithTimeout(context.Background(), time.Duration(waitTime)*time.Second)
-	defer cancal()
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	for {
-		select {
-		case <-ctx.Done():
-			logger.MainLog.Warningln("Wait NF Deregister timeout")
-			return
-		case <-ticker.C:
-			if a.Context().NfRegistNum == 0 {
-				logger.MainLog.Infoln("All Register NF had been deregister")
-				return
-			}
-		}
 	}
 }
 
