@@ -189,6 +189,8 @@ func (a *NrfApp) Start() {
 
 	logger.InitLog.Infoln("Server starting")
 
+	a.createNfProfileIndexes()
+
 	a.wg.Add(1)
 	go a.listenShutdownEvent()
 
@@ -222,6 +224,21 @@ func (a *NrfApp) listenShutdownEvent() {
 
 func (a *NrfApp) Terminate() {
 	a.cancel()
+}
+
+// createNfProfileIndexes backs the heart-beat sweep queries, which otherwise
+// scan the collection on every claim. Creation is idempotent, and a missing
+// index only costs performance, so failures are logged and not fatal.
+func (a *NrfApp) createNfProfileIndexes() {
+	coll := mongoapi.Client.Database(factory.NrfConfig.Configuration.MongoDBName).
+		Collection(nrf_context.NfProfileCollName)
+	indexes := []mongo.IndexModel{
+		{Keys: bson.D{{Key: "nfStatus", Value: 1}, {Key: "lastHeartBeat", Value: 1}}},
+		{Keys: bson.D{{Key: "nfStatus", Value: 1}, {Key: "suspendedAt", Value: 1}, {Key: "lastHeartBeat", Value: 1}}},
+	}
+	if _, err := coll.Indexes().CreateMany(a.ctx, indexes); err != nil {
+		logger.InitLog.Warnf("Create NfProfile indexes failed: %+v", err)
+	}
 }
 
 // sweepStaleNfProfiles runs the heart-beat sweeps once per heart-beat
