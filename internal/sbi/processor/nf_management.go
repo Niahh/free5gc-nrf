@@ -231,7 +231,8 @@ func touchLastHeartBeat(nfInstanceID string) error {
 }
 
 // clearSuspension moves a suspended instance back to REGISTERED. The status
-// filter makes racing the sweep safe in both orders.
+// filter makes racing the sweep safe in both orders. suspendedAt goes with
+// it: the drop sweep must never see a stale stamp on a live instance.
 func clearSuspension(nfInstanceID string) error {
 	_, err := mongoapi.Client.Database(factory.NrfConfig.Configuration.MongoDBName).
 		Collection(nrf_context.NfProfileCollName).
@@ -240,7 +241,10 @@ func clearSuspension(nfInstanceID string) error {
 				"nfInstanceId": nfInstanceID,
 				"nfStatus":     string(models.NrfNfManagementNfStatus_SUSPENDED),
 			},
-			bson.M{"$set": bson.M{"nfStatus": string(models.NrfNfManagementNfStatus_REGISTERED)}})
+			bson.M{
+				"$set":   bson.M{"nfStatus": string(models.NrfNfManagementNfStatus_REGISTERED)},
+				"$unset": bson.M{"suspendedAt": ""},
+			})
 	return err
 }
 
