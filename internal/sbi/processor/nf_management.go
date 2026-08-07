@@ -213,12 +213,20 @@ func (p *Processor) DropStaleSuspendedNfProfiles(ctx context.Context) {
 // touchLastHeartBeat records the contact the sweeps measure against. Stored
 // as fixed-width UTC RFC3339: $lt needs lexicographic order to match
 // chronological order, which fractional seconds or a zone offset would break.
+//
+// heartBeatTimer is re-stamped too: it is baked in at registration, and the
+// sweeps use the current configuration, so after a config change an NF ticking
+// at the old interval could flap into SUSPENDED. NFs adopt the value from
+// every 200 response, which is read from the document after this write.
 func touchLastHeartBeat(nfInstanceID string) error {
 	_, err := mongoapi.Client.Database(factory.NrfConfig.Configuration.MongoDBName).
 		Collection(nrf_context.NfProfileCollName).
 		UpdateOne(context.Background(),
 			bson.M{"nfInstanceId": nfInstanceID},
-			bson.M{"$set": bson.M{"lastHeartBeat": time.Now().UTC().Format(time.RFC3339)}})
+			bson.M{"$set": bson.M{
+				"lastHeartBeat":  time.Now().UTC().Format(time.RFC3339),
+				"heartBeatTimer": int32(factory.NrfConfig.GetHeartbeatTimer()),
+			}})
 	return err
 }
 
