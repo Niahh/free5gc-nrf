@@ -1,10 +1,14 @@
 package processor
 
 import (
+	"encoding/json"
 	"testing"
 
+	jsonpatch "github.com/evanphx/json-patch/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/free5gc/openapi/models"
 )
 
 func TestValidateNfProfilePatch(t *testing.T) {
@@ -63,6 +67,68 @@ func TestValidateNfProfilePatch(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := validateNfProfilePatch([]byte(tt.patch))
+			if tt.wantErr == "" {
+				assert.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+// TestCheckPatchInvariants pins the whole-document escape: a root-pointer op
+// (path "", RFC 6901) never matches the path guards in validateNfProfilePatch,
+// so the applied result must be checked against the stored profile.
+func TestCheckPatchInvariants(t *testing.T) {
+	const original = `{"nfInstanceId":"nf-1","nfType":"AUSF","nfStatus":"REGISTERED","heartBeatTimer":10}`
+
+	tests := []struct {
+		name    string
+		patch   string
+		wantErr string
+	}{
+		{
+			name:  "ordinary heart-beat",
+			patch: `[{"op":"replace","path":"/nfStatus","value":"REGISTERED"}]`,
+		},
+		{
+			name: "root replace preserving the NRF-owned fields",
+			patch: `[{"op":"replace","path":"","value":` +
+				`{"nfInstanceId":"nf-1","nfType":"AMF","nfStatus":"UNDISCOVERABLE","heartBeatTimer":10}}]`,
+		},
+		{
+			name: "root replace renaming nfInstanceId",
+			patch: `[{"op":"replace","path":"","value":` +
+				`{"nfInstanceId":"other","nfType":"AUSF","nfStatus":"REGISTERED","heartBeatTimer":10}}]`,
+			wantErr: "nfInstanceId is immutable",
+		},
+		{
+			name: "root replace changing heartBeatTimer",
+			patch: `[{"op":"replace","path":"","value":` +
+				`{"nfInstanceId":"nf-1","nfType":"AUSF","nfStatus":"REGISTERED","heartBeatTimer":3600}}]`,
+			wantErr: "heartBeatTimer is set by the NRF",
+		},
+		{
+			name: "root replace dropping heartBeatTimer",
+			patch: `[{"op":"replace","path":"","value":` +
+				`{"nfInstanceId":"nf-1","nfType":"AUSF","nfStatus":"REGISTERED"}}]`,
+			wantErr: "heartBeatTimer is set by the NRF",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			patch, err := jsonpatch.DecodePatch([]byte(tt.patch))
+			require.NoError(t, err)
+			patchedJSON, applyErr := patch.Apply([]byte(original))
+			require.NoError(t, applyErr)
+
+			var originalProfile, patchedProfile models.NrfNfManagementNfProfile
+			require.NoError(t, json.Unmarshal([]byte(original), &originalProfile))
+			require.NoError(t, json.Unmarshal(patchedJSON, &patchedProfile))
+
+			err = checkPatchInvariants(&originalProfile, &patchedProfile)
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
 				return

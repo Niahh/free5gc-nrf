@@ -632,6 +632,24 @@ func (p *Processor) UpdateNFInstanceProcedure(
 			Detail: err.Error(),
 		}
 	}
+	var originalProfile models.NrfNfManagementNfProfile
+	if err = json.Unmarshal(currentJSON, &originalProfile); err != nil {
+		logger.NfmLog.Errorf("UpdateNFInstanceProcedure err: %+v", err)
+		return nil, &models.ProblemDetails{
+			Title:  "System failure",
+			Status: http.StatusInternalServerError,
+			Detail: err.Error(),
+			Cause:  "SYSTEM_FAILURE",
+		}
+	}
+	if err := checkPatchInvariants(&originalProfile, &patchedProfile); err != nil {
+		logger.NfmLog.Warnf("Reject invalid NF profile patch result: %v", err)
+		return nil, &models.ProblemDetails{
+			Title:  "Malformed request syntax",
+			Status: http.StatusBadRequest,
+			Detail: err.Error(),
+		}
+	}
 
 	// The NFUpdate is the heart-beat (TS 29.510 clause 5.2.2.3): stamp it
 	// before the patch stores REGISTERED, or a concurrent sweep could claim
@@ -759,6 +777,19 @@ func validateNfProfilePatch(patchJSON []byte) error {
 		}
 	}
 
+	return nil
+}
+
+// checkPatchInvariants rejects a patch whose result changed an NRF-owned
+// field. The path guards in validateNfProfilePatch cannot see a whole-document
+// op (path "", RFC 6901), so the applied result is checked too.
+func checkPatchInvariants(original, patched *models.NrfNfManagementNfProfile) error {
+	if patched.NfInstanceId != original.NfInstanceId {
+		return fmt.Errorf("nfInstanceId is immutable and cannot be modified")
+	}
+	if patched.HeartBeatTimer != original.HeartBeatTimer {
+		return fmt.Errorf("heartBeatTimer is set by the NRF and cannot be modified")
+	}
 	return nil
 }
 
